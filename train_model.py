@@ -220,80 +220,107 @@ class EnhancedFeatureExtractor:
         return letters
 
 
-def create_enhanced_model(dictionary_path, model_save_path):
-    """Create and train enhanced model with validation"""
+def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="data/training_data.pt"):
+    """Create and train enhanced model with validation, using cached data if available"""
+    from pathlib import Path
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load dictionary and create feature extractor
-    print("Loading dictionary...")
-    with open(dictionary_path, 'r') as f:
-        dictionary = f.read().splitlines()
+    # Check for cached training data
+    data_cache_file = Path(data_cache_path)
+    if data_cache_file.exists():
+        print("Loading cached training data...")
+        cached_data = torch.load(data_cache_file, map_location=device)
+        X_train = cached_data['X_train']
+        y_train = cached_data['y_train']
+        X_val = cached_data['X_val']
+        y_val = cached_data['y_val']
+        feature_extractor = cached_data['feature_extractor']
 
-    feature_extractor = EnhancedFeatureExtractor(dictionary)
+        print(f"Loaded cached data - Training set size: {len(X_train)}, Validation set size: {len(X_val)}")
 
-    # Generate training data
-    print("Generating training data...")
-    X, y = [], []
+    else:
+        print("No cached data found. Generating training data...")
+        # Load dictionary and create feature extractor
+        with open(dictionary_path, 'r') as f:
+            dictionary = f.read().splitlines()
 
-    # Filter valid words first
-    valid_words = [word for word in dictionary if len(word) <= MAX_WORD_LENGTH]
+        feature_extractor = EnhancedFeatureExtractor(dictionary)
 
-    for word in tqdm(valid_words, desc="Generating training examples"):
-        # Generate multiple examples per word
-        for _ in range(5):  # Increased from 3 to 5 examples per word
-            guessed = []
-            pattern = ['_'] * len(word)
+        # Generate training data
+        print("Generating training data...")
+        X, y = [], []
 
-            # Simulate random game states
-            num_guesses = np.random.randint(0, 5)
-            for _ in range(num_guesses):
-                letter = np.random.choice(list(string.ascii_lowercase))
-                if letter not in guessed:
-                    guessed.append(letter)
-                    for i, char in enumerate(word):
-                        if char == letter:
-                            pattern[i] = letter
+        # Filter valid words first
+        valid_words = [word for word in dictionary if len(word) <= MAX_WORD_LENGTH]
 
-            features = feature_extractor.extract_features(pattern, guessed, device)
+        for word in tqdm(valid_words, desc="Generating training examples"):
+            # Generate multiple examples per word
+            for _ in range(5):
+                guessed = []
+                pattern = ['_'] * len(word)
 
-            # Create target vector with weighted probabilities
-            target = np.zeros(26)
-            remaining_letters = set(word) - set(guessed)
-            if remaining_letters:
-                # Weight letters by their position in the word
-                total_weight = 0
-                for letter in remaining_letters:
-                    weight = 1.0
-                    if letter in word[0]:  # First letter bonus
-                        weight *= 1.5
-                    if letter in word[-1]:  # Last letter bonus
-                        weight *= 1.5
-                    if letter in 'aeiou':  # Vowel bonus
-                        weight *= 1.2
-                    target[ord(letter) - ord('a')] = weight
-                    total_weight += weight
+                # Simulate random game states
+                num_guesses = np.random.randint(0, 5)
+                for _ in range(num_guesses):
+                    letter = np.random.choice(list(string.ascii_lowercase))
+                    if letter not in guessed:
+                        guessed.append(letter)
+                        for i, char in enumerate(word):
+                            if char == letter:
+                                pattern[i] = letter
 
-                # Normalize weights
-                if total_weight > 0:
-                    target = target / total_weight
+                features = feature_extractor.extract_features(pattern, guessed, device)
 
-            X.append(features)
-            y.append(torch.FloatTensor(target).to(device))
+                # Create target vector with weighted probabilities
+                target = np.zeros(26)
+                remaining_letters = set(word) - set(guessed)
+                if remaining_letters:
+                    # Weight letters by their position in the word
+                    total_weight = 0
+                    for letter in remaining_letters:
+                        weight = 1.0
+                        if letter in word[0]:  # First letter bonus
+                            weight *= 1.5
+                        if letter in word[-1]:  # Last letter bonus
+                            weight *= 1.5
+                        if letter in 'aeiou':  # Vowel bonus
+                            weight *= 1.2
+                        target[ord(letter) - ord('a')] = weight
+                        total_weight += weight
 
-    X = torch.stack(X)
-    y = torch.stack(y)
+                    # Normalize weights
+                    if total_weight > 0:
+                        target = target / total_weight
 
-    print(f"Generated {len(X)} training examples")
+                X.append(features)
+                y.append(torch.FloatTensor(target).to(device))
 
-    # Split into train/validation sets
-    indices = torch.randperm(len(X))
-    split = int(0.9 * len(X))
-    train_indices = indices[:split]
-    val_indices = indices[split:]
+        X = torch.stack(X)
+        y = torch.stack(y)
 
-    X_train, y_train = X[train_indices], y[train_indices]
-    X_val, y_val = X[val_indices], y[val_indices]
+        print(f"Generated {len(X)} training examples")
+
+        # Split into train/validation sets
+        indices = torch.randperm(len(X))
+        split = int(0.9 * len(X))
+        train_indices = indices[:split]
+        val_indices = indices[split:]
+
+        X_train, y_train = X[train_indices], y[train_indices]
+        X_val, y_val = X[val_indices], y[val_indices]
+
+        # Save the processed data
+        print("Saving training data to cache...")
+        data_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'X_train': X_train,
+            'y_train': y_train,
+            'X_val': X_val,
+            'y_val': y_val,
+            'feature_extractor': feature_extractor
+        }, data_cache_file)
+        print(f"Data cached to {data_cache_file}")
 
     print(f"Training set size: {len(X_train)}, Validation set size: {len(X_val)}")
 
@@ -315,11 +342,11 @@ def create_enhanced_model(dictionary_path, model_save_path):
         model.train()
         total_train_loss = 0
         train_batches = tqdm(range(0, len(X_train), batch_size),
-                             desc=f"Epoch {epoch + 1}/{epochs} [Train]")
+                             desc=f"Epoch {epoch+1}/{epochs} [Train]")
 
         for i in train_batches:
-            batch_X = X_train[i:i + batch_size]
-            batch_y = y_train[i:i + batch_size]
+            batch_X = X_train[i:i+batch_size]
+            batch_y = y_train[i:i+batch_size]
 
             optimizer.zero_grad()
             outputs = model(batch_X)
@@ -336,12 +363,12 @@ def create_enhanced_model(dictionary_path, model_save_path):
         model.eval()
         total_val_loss = 0
         val_batches = tqdm(range(0, len(X_val), batch_size),
-                           desc=f"Epoch {epoch + 1}/{epochs} [Val]")
+                           desc=f"Epoch {epoch+1}/{epochs} [Val]")
 
         with torch.no_grad():
             for i in val_batches:
-                batch_X = X_val[i:i + batch_size]
-                batch_y = y_val[i:i + batch_size]
+                batch_X = X_val[i:i+batch_size]
+                batch_y = y_val[i:i+batch_size]
 
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
@@ -350,7 +377,7 @@ def create_enhanced_model(dictionary_path, model_save_path):
 
         avg_val_loss = total_val_loss / len(val_batches)
 
-        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print(f"\nEpoch {epoch+1}/{epochs}")
         print(f"Average Train Loss: {avg_train_loss:.4f}")
         print(f"Average Val Loss: {avg_val_loss:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n")
