@@ -3,329 +3,345 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import string
-import re
+import random
+from pathlib import Path
 from collections import Counter
 from tqdm.auto import tqdm
 
-from hangman_model import EnhancedHangmanNN
+from hangman_model import HangmanNN
 
 # Constants
 MAX_WORD_LENGTH = 20
-NUM_LETTERS = 26
-NGRAM_SIZE = 3
+NUM_LETTERS = len(string.ascii_lowercase)  # 26
+
+# Calculate feature size components
+PATTERN_FEATURES = MAX_WORD_LENGTH        # One-hot word pattern
+GUESSED_FEATURES = NUM_LETTERS            # Letter presence
+NGRAM_FEATURES = NUM_LETTERS              # N-gram based scores
+LETTER_FREQ_FEATURES = NUM_LETTERS        # Letter frequencies
+STRUCTURE_FEATURES = 2                    # Word length and num guesses
+RATIO_FEATURES = 2                        # Vowel and consonant ratios
+
+# Total feature size
 FEATURE_SIZE = (
-        MAX_WORD_LENGTH +  # One-hot word pattern
-        NUM_LETTERS +  # Letter presence
-        NUM_LETTERS * 2 +  # Position-specific letter probabilities (start/end)
-        NUM_LETTERS +  # Letter frequencies in matching words
-        NGRAM_SIZE * NUM_LETTERS +  # N-gram features
-        4  # Additional features (word length, num guesses, vowel ratio, consonant ratio)
+        PATTERN_FEATURES +    # 20
+        GUESSED_FEATURES +    # 26
+        NGRAM_FEATURES +      # 26
+        LETTER_FREQ_FEATURES + # 26
+        STRUCTURE_FEATURES +  # 2
+        RATIO_FEATURES       # 2
 )
 
 
-class EnhancedFeatureExtractor:
+class BalancedFeatureExtractor:
     def __init__(self, dictionary):
-        print("Initializing Enhanced Feature Extractor...")
+        print("Initializing Balanced Feature Extractor...")
 
-        self.dictionary = dictionary
-        print(f"Dictionary size: {len(dictionary)} words")
+        # Store feature sizes for verification
+        self.feature_sizes = {
+            'pattern': PATTERN_FEATURES,
+            'guessed': GUESSED_FEATURES,
+            'ngram': NGRAM_FEATURES,
+            'letter_freq': LETTER_FREQ_FEATURES,
+            'structure': STRUCTURE_FEATURES,
+            'ratio': RATIO_FEATURES
+        }
 
-        print("Building frequency tables...")
-        with tqdm(total=2, desc="Building frequency data") as pbar:
-            self.letter_pos_freq = self._build_position_frequencies()
-            pbar.update(1)
-            self.ngram_freq = self._build_ngram_frequencies()
-            pbar.update(1)
+        # Pre-filter valid words
+        self.dictionary = [word for word in dictionary if len(word) <= MAX_WORD_LENGTH]
+        print(f"Dictionary size after filtering: {len(self.dictionary)} words")
 
-    def _build_position_frequencies(self):
-        """Build letter frequency dictionary for start and end positions"""
-        print("Building position frequencies...")
-        start_freq = Counter()
-        end_freq = Counter()
+        # Pre-compute letter positions for all words
+        print("Pre-computing word letter positions...")
+        self.word_letters = {}
+        for word in tqdm(self.dictionary):
+            self.word_letters[word] = {char: [i for i, c in enumerate(word) if c == char]
+                                       for char in set(word)}
 
-        for word in tqdm(self.dictionary, desc="Analyzing word positions"):
-            if word:
-                start_freq[word[0]] += 1
-                end_freq[word[-1]] += 1
+        # Build positional n-grams
+        print("Building positional n-grams...")
+        self.positional_ngrams = self._build_positional_ngrams()
 
-        # Normalize frequencies
-        total_words = len(self.dictionary)
-        start_probs = {letter: count / total_words for letter, count in start_freq.items()}
-        end_probs = {letter: count / total_words for letter, count in end_freq.items()}
+        # Pre-compute word lengths
+        self.word_lengths = {word: len(word) for word in self.dictionary}
 
-        return {'start': start_probs, 'end': end_probs}
+        # Build letter frequency table
+        all_letters = "".join(self.dictionary)
+        total_letters = len(all_letters)
+        self.letter_frequencies: dict[str, float] = {}
+        for letter in string.ascii_lowercase:
+            self.letter_frequencies[letter] = all_letters.count(letter) / total_letters
 
-    def _build_ngram_frequencies(self):
-        """Build n-gram frequency dictionary"""
-        print("Building n-gram frequencies...")
-        ngram_freq = [Counter() for _ in range(NGRAM_SIZE)]
-        normalized_freq = []
+    def _build_positional_ngrams(self):
+        """Build position-aware n-gram frequencies"""
+        from collections import defaultdict
 
-        # Count frequencies
-        for word in tqdm(self.dictionary, desc="Analyzing n-grams"):
-            for n in range(1, NGRAM_SIZE + 1):
-                for i in range(len(word) - n + 1):
-                    ngram = word[i:i + n]
-                    ngram_freq[n - 1][ngram] += 1
+        # Structure: {position: {ngram: {next_letter: count}}}
+        ngram_data = defaultdict(lambda: defaultdict(Counter))
 
-        # Normalize frequencies
-        print("Normalizing n-gram frequencies...")
-        for counter in tqdm(ngram_freq, desc="Normalizing"):
-            total = sum(counter.values())
-            if total > 0:
-                normalized = Counter({k: v / total for k, v in counter.items()})
-            else:
-                normalized = Counter()
-            normalized_freq.append(normalized)
+        for word in tqdm(self.dictionary, desc="Computing n-grams"):
+            # For each position in the word
+            for pos in range(len(word) - 1):
+                # For each n-gram size (1 and 2 for efficiency)
+                for n in range(1, min(3, len(word) - pos)):
+                    ngram = word[pos:pos + n]
+                    next_letter = word[pos + n]
+                    ngram_data[pos][ngram][next_letter] += 1
 
-        return normalized_freq
+        # Normalize counts to probabilities
+        normalized_data = {}
+        for pos in ngram_data:
+            normalized_data[pos] = {}
+            for ngram, next_counts in ngram_data[pos].items():
+                total = sum(next_counts.values())
+                normalized_data[pos][ngram] = {
+                    letter: count/total
+                    for letter, count in next_counts.items()
+                }
 
-    def get_matching_words(self, pattern, guessed_letters):
-        """Get all words matching the current pattern"""
-        # Handle both string and list patterns
-        if isinstance(pattern, list):
-            clean_pattern = "".join(pattern)
-        else:
-            clean_pattern = pattern[::2]  # Remove spaces if string input
+        return normalized_data
 
-        # Convert to regex pattern
-        regex_pattern = clean_pattern.replace("_", ".")
-        len_word = len(clean_pattern)
+    def get_ngram_scores(self, pattern, guessed_letters):
+        """Get letter scores based on positional n-grams"""
+        scores = Counter()
 
-        # Find matching words using regex
-        matching_words = [
-            word for word in self.dictionary
-            if len(word) == len_word and re.match(regex_pattern, word)
-        ]
+        # Get position of each underscore
+        unknown_positions = [i for i, char in enumerate(pattern) if char == '_']
 
-        return matching_words
+        for pos in unknown_positions:
+            # Look at previous letter(s) if available
+            if pos > 0:
+                prev_letter = pattern[pos-1]
+                if prev_letter != '_':
+                    # Single letter context
+                    if pos-1 in self.positional_ngrams and prev_letter in self.positional_ngrams[pos-1]:
+                        next_probs = self.positional_ngrams[pos-1][prev_letter]
+                        for letter, prob in next_probs.items():
+                            if letter not in guessed_letters:
+                                scores[letter] += prob
 
-    def extract_features(self, word_pattern, guessed_letters, device):
-        """Extract enhanced feature vector"""
+                    # Two letter context if available
+                    if pos > 1 and pattern[pos-2] != '_':
+                        bigram = pattern[pos-2:pos]
+                        if pos-2 in self.positional_ngrams and bigram in self.positional_ngrams[pos-2]:
+                            next_probs = self.positional_ngrams[pos-2][bigram]
+                            for letter, prob in next_probs.items():
+                                if letter not in guessed_letters:
+                                    scores[letter] += prob * 2  # Weight bigrams more
+
+        return scores
+
+    def extract_features_balanced(self, word_pattern, guessed_letters, device):
+        """Extract features with size verification"""
         features = []
 
-        # Clean pattern handling both string and list inputs
+        # Clean pattern
         if isinstance(word_pattern, list):
             clean_pattern = "".join(word_pattern)
         else:
-            clean_pattern = word_pattern[::2]  # Remove spaces if string input
-        pattern_len = len(clean_pattern)
+            clean_pattern = word_pattern[::2]
 
-        # Get matching words for this pattern
-        matching_words = self.get_matching_words(word_pattern, guessed_letters)
+        # Track feature counts for verification
+        feature_counts = {key: 0 for key in self.feature_sizes.keys()}
 
-        # Build features in sequence
-        feature_components = {
-            'pattern': self._get_pattern_features(clean_pattern),
-            'letters': self._get_letter_features(guessed_letters),
-            'position': self._get_position_features(matching_words),
-            'frequency': self._get_frequency_features(matching_words),
-            'ngram': self._get_ngram_features(matching_words),
-            'metadata': self._get_metadata_features(clean_pattern, guessed_letters, matching_words)
-        }
-
-        # Combine all features
-        for component in feature_components.values():
-            features.extend(component)
-
-        assert len(features) == FEATURE_SIZE, f"Feature size mismatch: {len(features)} != {FEATURE_SIZE}"
-        return torch.FloatTensor(features).to(device)
-
-    def _get_pattern_features(self, clean_pattern):
-        """Extract pattern-based features"""
+        # 1. Pattern features (MAX_WORD_LENGTH)
         pattern_features = []
         for pos in range(MAX_WORD_LENGTH):
             if pos < len(clean_pattern):
                 pattern_features.append(1 if clean_pattern[pos] != '_' else 0)
             else:
                 pattern_features.append(0)
-        return pattern_features
+        features.extend(pattern_features)
+        feature_counts['pattern'] = len(pattern_features)
 
-    def _get_letter_features(self, guessed_letters):
-        """Extract letter-based features"""
-        return [1 if letter in guessed_letters else 0 for letter in string.ascii_lowercase]
+        # 2. Guessed letters (NUM_LETTERS)
+        guessed_features = [1 if letter in guessed_letters else 0
+                            for letter in string.ascii_lowercase]
+        features.extend(guessed_features)
+        feature_counts['guessed'] = len(guessed_features)
 
-    def _get_position_features(self, matching_words):
-        """Extract position-specific features"""
-        features = []
+        # 3. N-gram based scores (NUM_LETTERS)
+        ngram_scores = self.get_ngram_scores(clean_pattern, guessed_letters)
+        ngram_features = [ngram_scores[letter] for letter in string.ascii_lowercase]
+        features.extend(ngram_features)
+        feature_counts['ngram'] = len(ngram_features)
 
-        # Start position probabilities
-        for letter in string.ascii_lowercase:
-            features.append(self.letter_pos_freq['start'].get(letter, 0))
-
-        # End position probabilities
-        for letter in string.ascii_lowercase:
-            features.append(self.letter_pos_freq['end'].get(letter, 0))
-
-        return features
-
-    def _get_frequency_features(self, matching_words):
-        """Extract frequency-based features"""
+        # 4. Letter frequencies (NUM_LETTERS)
+        matching_words = self.get_matching_words_fast(clean_pattern)
         if matching_words:
-            freq = Counter("".join(matching_words))
-            total = sum(freq.values())
-            return [freq.get(letter, 0) / total if total > 0 else 0
-                    for letter in string.ascii_lowercase]
-        return [0] * NUM_LETTERS
-
-    def _get_ngram_features(self, matching_words):
-        """Extract n-gram based features"""
-        features = []
-
-        for n in range(NGRAM_SIZE):
-            letter_scores = {letter: 0.0 for letter in string.ascii_lowercase}
-
-            if matching_words:
-                for word in matching_words:
-                    for i in range(len(word) - n):
-                        ngram = word[i:i + n + 1]
-                        if ngram in self.ngram_freq[n]:
-                            for letter in ngram:
-                                letter_scores[letter] += self.ngram_freq[n][ngram]
-
-            features.extend(letter_scores.values())
-
-        return features
-
-    def _get_metadata_features(self, clean_pattern, guessed_letters, matching_words):
-        """Extract metadata features"""
-        features = []
-
-        # Word length (normalized)
-        features.append(len(clean_pattern) / MAX_WORD_LENGTH)
-
-        # Number of guesses (normalized)
-        features.append(len(guessed_letters) / 6.0)
-
-        # Vowel and consonant ratios
-        remaining_positions = clean_pattern.count('_')
-        if remaining_positions > 0:
-            vowel_ratio = sum(1 for pos, char in enumerate(clean_pattern)
-                              if char == '_' and any(v in self.get_likely_letters(pos, matching_words)
-                                                     for v in 'aeiou')) / remaining_positions
-            consonant_ratio = 1 - vowel_ratio
+            all_letters = "".join(matching_words)
+            total = len(all_letters)
+            freq_features = [all_letters.count(letter) / total if total > 0 else 0
+                             for letter in string.ascii_lowercase]
         else:
-            vowel_ratio = consonant_ratio = 0
+            freq_features = [self.letter_frequencies[letter]
+                             for letter in string.ascii_lowercase]
+        features.extend(freq_features)
+        feature_counts['letter_freq'] = len(freq_features)
 
-        features.extend([vowel_ratio, consonant_ratio])
+        # 5. Word structure features (2)
+        structure_features = [
+            len(clean_pattern) / MAX_WORD_LENGTH,  # length
+            len(guessed_letters) / 6.0             # num guesses
+        ]
+        features.extend(structure_features)
+        feature_counts['structure'] = len(structure_features)
 
-        return features
+        # 6. Vowel/consonant ratios (2)
+        remaining = clean_pattern.count('_')
+        if remaining > 0:
+            vowels = set('aeiou')
+            consonants = set(string.ascii_lowercase) - vowels
+            vowel_score = sum(ngram_scores[l] for l in vowels if l not in guessed_letters)
+            consonant_score = sum(ngram_scores[l] for l in consonants if l not in guessed_letters)
+            total_score = vowel_score + consonant_score
+            if total_score > 0:
+                vowel_ratio = vowel_score / total_score
+            else:
+                vowel_ratio = 0.4
+        else:
+            vowel_ratio = 0
 
-    def get_likely_letters(self, position, matching_words):
-        """Get likely letters for a position based on matching words"""
-        letters = set()
-        for word in matching_words:
-            if position < len(word):
-                letters.add(word[position])
-        return letters
+        ratio_features = [vowel_ratio, 1 - vowel_ratio]
+        features.extend(ratio_features)
+        feature_counts['ratio'] = len(ratio_features)
+
+        # Verify feature sizes
+        for key, count in feature_counts.items():
+            expected = self.feature_sizes[key]
+            assert count == expected, f"Feature size mismatch for {key}: got {count}, expected {expected}"
+
+        assert len(features) == FEATURE_SIZE, f"Total feature size mismatch: got {len(features)}, expected {FEATURE_SIZE}"
+
+        return torch.FloatTensor(features).to(device)
+
+    def get_matching_words_fast(self, pattern):
+        """Faster word matching without regex"""
+        pattern_len = len(pattern)
+        matching = []
+
+        for word in self.dictionary:
+            if self.word_lengths[word] != pattern_len:
+                continue
+
+            matches = True
+            for i, char in enumerate(pattern):
+                if char != '_' and char != word[i]:
+                    matches = False
+                    break
+            if matches:
+                matching.append(word)
+
+        return matching
 
 
-def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="data/training_data.pt"):
-    """Create and train enhanced model with validation, using cached data if available"""
-    from pathlib import Path
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def generate_training_data_fast(feature_extractor, device,
+                                data_cache_path="data/training_data.pt",
+                                max_examples=100000,
+                                examples_per_word=5):
+    """Generate training data with caching"""
 
-    # Check for cached training data
-    data_cache_file = Path(data_cache_path)
-    if data_cache_file.exists():
+    # Check for cached data
+    cache_path = Path(data_cache_path)
+    if cache_path.exists():
         print("Loading cached training data...")
-        cached_data = torch.load(data_cache_file, map_location=device)
-        X_train = cached_data['X_train']
-        y_train = cached_data['y_train']
-        X_val = cached_data['X_val']
-        y_val = cached_data['y_val']
-        feature_extractor = cached_data['feature_extractor']
+        try:
+            data = torch.load(cache_path, map_location=device)
+            print(f"Loaded {len(data['X'])} cached examples")
+            return data['X'], data['y'], data['feature_extractor']
+        except Exception as e:
+            print(f"Error loading cached data: {e}")
+            print("Regenerating training data...")
 
-        print(f"Loaded cached data - Training set size: {len(X_train)}, Validation set size: {len(X_val)}")
+    X, y = [], []
 
-    else:
-        print("No cached data found. Generating training data...")
-        # Load dictionary and create feature extractor
-        with open(dictionary_path, 'r') as f:
-            dictionary = f.read().splitlines()
+    # Pre-generate random states for all examples
+    print("Generating random states...")
+    all_words = [(word, i) for word in feature_extractor.dictionary
+                 for i in range(examples_per_word)]
+    random.shuffle(all_words)
 
-        feature_extractor = EnhancedFeatureExtractor(dictionary)
+    try:
+        # Process in batches
+        batch_size = 1000
+        for i in tqdm(range(0, len(all_words), batch_size), desc="Generating training examples"):
+            batch_words = all_words[i:i+batch_size]
 
-        # Generate training data
-        print("Generating training data...")
-        X, y = [], []
-
-        # Filter valid words first
-        valid_words = [word for word in dictionary if len(word) <= MAX_WORD_LENGTH]
-
-        for word in tqdm(valid_words, desc="Generating training examples"):
-            # Generate multiple examples per word
-            for _ in range(5):
+            for word, _ in batch_words:
                 guessed = []
                 pattern = ['_'] * len(word)
 
-                # Simulate random game states
+                # Simulate game state
                 num_guesses = np.random.randint(0, 5)
-                for _ in range(num_guesses):
-                    letter = np.random.choice(list(string.ascii_lowercase))
+                letters_to_guess = random.sample(string.ascii_lowercase, num_guesses)
+
+                for letter in letters_to_guess:
                     if letter not in guessed:
                         guessed.append(letter)
-                        for i, char in enumerate(word):
-                            if char == letter:
-                                pattern[i] = letter
+                        if letter in word:
+                            for pos in feature_extractor.word_letters[word].get(letter, []):
+                                pattern[pos] = letter
 
-                features = feature_extractor.extract_features(pattern, guessed, device)
+                # Extract features
+                features = feature_extractor.extract_features_balanced(pattern, guessed, device)
 
-                # Create target vector with weighted probabilities
+                # Create target
                 target = np.zeros(26)
                 remaining_letters = set(word) - set(guessed)
                 if remaining_letters:
-                    # Weight letters by their position in the word
-                    total_weight = 0
                     for letter in remaining_letters:
                         weight = 1.0
-                        if letter in word[0]:  # First letter bonus
-                            weight *= 1.5
-                        if letter in word[-1]:  # Last letter bonus
-                            weight *= 1.5
-                        if letter in 'aeiou':  # Vowel bonus
-                            weight *= 1.2
+                        if letter == word[0]: weight *= 1.5
+                        if letter == word[-1]: weight *= 1.5
+                        if letter in 'aeiou': weight *= 1.2
                         target[ord(letter) - ord('a')] = weight
-                        total_weight += weight
-
-                    # Normalize weights
-                    if total_weight > 0:
-                        target = target / total_weight
+                    target = target / target.sum()
 
                 X.append(features)
                 y.append(torch.FloatTensor(target).to(device))
 
-        X = torch.stack(X)
-        y = torch.stack(y)
+                if len(X) >= max_examples:
+                    print(f"\nReached maximum examples limit ({max_examples})")
+                    raise StopIteration  # Use exception to break out of nested loops
 
-        print(f"Generated {len(X)} training examples")
+    except StopIteration:
+        pass  # Handle the max examples case gracefully
+    finally:
+        # Always stack and save the data, regardless of how we exited the loop
+        if X and y:  # Make sure we have some data
+            print(f"\nStacking {len(X)} examples...")
+            X = torch.stack(X)
+            y = torch.stack(y)
 
-        # Split into train/validation sets
-        indices = torch.randperm(len(X))
-        split = int(0.9 * len(X))
-        train_indices = indices[:split]
-        val_indices = indices[split:]
+            print("Saving training data to cache...")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                'X': X,
+                'y': y,
+                'feature_extractor': feature_extractor
+            }, cache_path)
+            print(f"Data cached to {cache_path}")
+        else:
+            print("No examples were generated!")
 
-        X_train, y_train = X[train_indices], y[train_indices]
-        X_val, y_val = X[val_indices], y[val_indices]
+    return X, y, feature_extractor
 
-        # Save the processed data
-        print("Saving training data to cache...")
-        data_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            'X_train': X_train,
-            'y_train': y_train,
-            'X_val': X_val,
-            'y_val': y_val,
-            'feature_extractor': feature_extractor
-        }, data_cache_file)
-        print(f"Data cached to {data_cache_file}")
+
+def train_model(X, y, model_save_path, device):
+    """Train the model with validation"""
+    # Split into train/validation
+    indices = torch.randperm(len(X))
+    split = int(0.9 * len(X))
+    train_indices = indices[:split]
+    val_indices = indices[split:]
+
+    X_train, y_train = X[train_indices], y[train_indices]
+    X_val, y_val = X[val_indices], y[val_indices]
 
     print(f"Training set size: {len(X_train)}, Validation set size: {len(X_val)}")
 
-    # Create and train model
-    model = EnhancedHangmanNN().to(device)
+    # Initialize model and training
+    model = HangmanNN().to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
@@ -342,11 +358,11 @@ def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="dat
         model.train()
         total_train_loss = 0
         train_batches = tqdm(range(0, len(X_train), batch_size),
-                             desc=f"Epoch {epoch+1}/{epochs} [Train]")
+                             desc=f"Epoch {epoch + 1}/{epochs} [Train]")
 
         for i in train_batches:
-            batch_X = X_train[i:i+batch_size]
-            batch_y = y_train[i:i+batch_size]
+            batch_X = X_train[i:i + batch_size]
+            batch_y = y_train[i:i + batch_size]
 
             optimizer.zero_grad()
             outputs = model(batch_X)
@@ -363,12 +379,12 @@ def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="dat
         model.eval()
         total_val_loss = 0
         val_batches = tqdm(range(0, len(X_val), batch_size),
-                           desc=f"Epoch {epoch+1}/{epochs} [Val]")
+                           desc=f"Epoch {epoch + 1}/{epochs} [Val]")
 
         with torch.no_grad():
             for i in val_batches:
-                batch_X = X_val[i:i+batch_size]
-                batch_y = y_val[i:i+batch_size]
+                batch_X = X_val[i:i + batch_size]
+                batch_y = y_val[i:i + batch_size]
 
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
@@ -377,7 +393,7 @@ def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="dat
 
         avg_val_loss = total_val_loss / len(val_batches)
 
-        print(f"\nEpoch {epoch+1}/{epochs}")
+        print(f"\nEpoch {epoch + 1}/{epochs}")
         print(f"Average Train Loss: {avg_train_loss:.4f}")
         print(f"Average Val Loss: {avg_val_loss:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n")
@@ -405,11 +421,40 @@ def create_enhanced_model(dictionary_path, model_save_path, data_cache_path="dat
                 break
 
     print("\nTraining completed!")
-    return feature_extractor
+    return model
 
 
-if __name__ == '__main__':
-    feature_extractor = create_enhanced_model(
-        dictionary_path="words_250000_train.txt",
-        model_save_path="models/enhanced_hangman_model.pt"
+def main():
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Paths
+    dictionary_path = "words_250000_train.txt"
+    model_save_path = "models/hangman_model.pt"
+    data_cache_path = "data/training_data.pt"
+
+    # Load dictionary
+    print("Loading dictionary...")
+    with open(dictionary_path, 'r') as f:
+        dictionary = f.read().splitlines()
+
+    # Create feature extractor
+    feature_extractor = BalancedFeatureExtractor(dictionary)
+
+    # Generate or load training data
+    X, y, feature_extractor = generate_training_data_fast(
+        feature_extractor=feature_extractor,
+        device=device,
+        data_cache_path=data_cache_path,
+        max_examples=500000
     )
+
+    # Train model
+    model = train_model(X, y, model_save_path, device)
+
+    return model, feature_extractor
+
+
+if __name__ == "__main__":
+    main()
